@@ -13,8 +13,10 @@ from PIL import Image
 
 from mmseg.core.evaluation import get_classes, get_palette
 from mmseg.datasets import (DATASETS, ADE20KDataset, CityscapesDataset,
-                            ConcatDataset, CustomDataset, LoveDADataset,
-                            PascalVOCDataset, RepeatDataset, build_dataset)
+                            COCOStuffDataset, ConcatDataset, CustomDataset,
+                            ISPRSDataset, LoveDADataset, MultiImageMixDataset,
+                            PascalVOCDataset, PotsdamDataset, RepeatDataset,
+                            build_dataset, iSAIDDataset)
 
 
 def test_classes():
@@ -23,6 +25,11 @@ def test_classes():
         'pascal_voc')
     assert list(
         ADE20KDataset.CLASSES) == get_classes('ade') == get_classes('ade20k')
+    assert list(COCOStuffDataset.CLASSES) == get_classes('cocostuff')
+    assert list(LoveDADataset.CLASSES) == get_classes('loveda')
+    assert list(PotsdamDataset.CLASSES) == get_classes('potsdam')
+    assert list(ISPRSDataset.CLASSES) == get_classes('vaihingen')
+    assert list(iSAIDDataset.CLASSES) == get_classes('isaid')
 
     with pytest.raises(ValueError):
         get_classes('unsupported')
@@ -64,6 +71,10 @@ def test_palette():
     assert PascalVOCDataset.PALETTE == get_palette('voc') == get_palette(
         'pascal_voc')
     assert ADE20KDataset.PALETTE == get_palette('ade') == get_palette('ade20k')
+    assert LoveDADataset.PALETTE == get_palette('loveda')
+    assert PotsdamDataset.PALETTE == get_palette('potsdam')
+    assert COCOStuffDataset.PALETTE == get_palette('cocostuff')
+    assert iSAIDDataset.PALETTE == get_palette('isaid')
 
     with pytest.raises(ValueError):
         get_palette('unsupported')
@@ -94,6 +105,59 @@ def test_dataset_wrapper():
     assert repeat_dataset[15] == 5
     assert repeat_dataset[27] == 7
     assert len(repeat_dataset) == 10 * len(dataset_a)
+
+    img_scale = (60, 60)
+    pipeline = [
+        dict(type='RandomMosaic', prob=1, img_scale=img_scale),
+        dict(type='RandomFlip', prob=0.5),
+        dict(type='Resize', img_scale=img_scale, keep_ratio=False),
+    ]
+
+    CustomDataset.load_annotations = MagicMock()
+    results = []
+    for _ in range(2):
+        height = np.random.randint(10, 30)
+        weight = np.random.randint(10, 30)
+        img = np.ones((height, weight, 3))
+        gt_semantic_seg = np.random.randint(5, size=(height, weight))
+        results.append(dict(gt_semantic_seg=gt_semantic_seg, img=img))
+
+    classes = ['0', '1', '2', '3', '4']
+    palette = [(0, 0, 0), (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4)]
+    CustomDataset.__getitem__ = MagicMock(side_effect=lambda idx: results[idx])
+    dataset_a = CustomDataset(
+        img_dir=MagicMock(),
+        pipeline=[],
+        test_mode=True,
+        classes=classes,
+        palette=palette)
+    len_a = 2
+    dataset_a.img_infos = MagicMock()
+    dataset_a.img_infos.__len__.return_value = len_a
+
+    multi_image_mix_dataset = MultiImageMixDataset(dataset_a, pipeline)
+    assert len(multi_image_mix_dataset) == len(dataset_a)
+
+    for idx in range(len_a):
+        results_ = multi_image_mix_dataset[idx]
+
+    # test skip_type_keys
+    multi_image_mix_dataset = MultiImageMixDataset(
+        dataset_a, pipeline, skip_type_keys=('RandomFlip'))
+    for idx in range(len_a):
+        results_ = multi_image_mix_dataset[idx]
+        assert results_['img'].shape == (img_scale[0], img_scale[1], 3)
+
+    skip_type_keys = ('RandomFlip', 'Resize')
+    multi_image_mix_dataset.update_skip_type_keys(skip_type_keys)
+    for idx in range(len_a):
+        results_ = multi_image_mix_dataset[idx]
+        assert results_['img'].shape[:2] != img_scale
+
+    # test pipeline
+    with pytest.raises(TypeError):
+        pipeline = [['Resize']]
+        multi_image_mix_dataset = MultiImageMixDataset(dataset_a, pipeline)
 
 
 def test_custom_dataset():
@@ -299,6 +363,69 @@ def test_custom_dataset():
     assert not np.isnan(eval_results['mFscore'])
     assert not np.isnan(eval_results['mPrecision'])
     assert not np.isnan(eval_results['mRecall'])
+
+
+def test_custom_dataset_pre_eval():
+    """Test pre-eval function of custom dataset with reduce zero label and
+    removed classes.
+
+    The GT segmentation contain 4 classes: "A", "B", "C", "D", as well as
+    a zero label. Therefore, the labels go from 0 to 4.
+
+    Then, we will remove class "C" while instantiating the dataset. Therefore,
+    pre-eval must reduce the zero label and also apply label_map in the correct
+    order.
+    """
+
+    # create a dummy dataset on disk
+    img = np.random.rand(10, 10)
+    ann = np.zeros_like(img)
+    ann[2:4, 2:4] = 1
+    ann[2:4, 6:8] = 2
+    ann[6:8, 2:4] = 3
+    ann[6:8, 6:8] = 4
+
+    tmp_dir = tempfile.TemporaryDirectory()
+    img_path = osp.join(tmp_dir.name, 'img', '00000.jpg')
+    ann_path = osp.join(tmp_dir.name, 'ann', '00000.png')
+
+    import mmcv
+    mmcv.imwrite(img, img_path)
+    mmcv.imwrite(ann, ann_path)
+
+    class FourClassDatasetWithZeroLabel(CustomDataset):
+        CLASSES = ['A', 'B', 'C', 'D']  # 4 classes
+        PALETTE = [(0, 0, 0)] * 4  # dummy palette
+
+    # with img_dir, ann_dir, split
+    dataset = FourClassDatasetWithZeroLabel(
+        [],
+        classes=['A', 'B', 'D'],  # original classes with class "C" removed
+        reduce_zero_label=True,  # reduce zero label set to True
+        data_root=osp.join(osp.dirname(__file__), tmp_dir.name),
+        img_dir='img/',
+        ann_dir='ann/',
+        img_suffix='.jpg',
+        seg_map_suffix='.png')
+    assert len(dataset) == 1
+
+    # there are three classes ("A", "B", "D") that the network predicts
+    perfect_pred = np.zeros([10, 10], dtype=np.int64)
+    perfect_pred[2:4, 2:4] = 0  # 'A': 1 reduced to 0 that maps to 0
+    perfect_pred[2:4, 6:8] = 1  # 'B': 2 reduced to 1 that maps to 1
+    perfect_pred[6:8, 2:4] = 0  # 'C': 3 reduced to 2 that maps to -1, ignored
+    perfect_pred[6:8, 6:8] = 2  # 'D': 4 reduced to 3 that maps to 2
+
+    results = dataset.pre_eval([perfect_pred], [0])
+    from mmseg.core.evaluation.metrics import pre_eval_to_metrics
+    eval_results = pre_eval_to_metrics(results, ['mIoU', 'mDice', 'mFscore'])
+
+    # the results should be perfect
+    for metric in 'IoU', 'aAcc', 'Acc', 'Dice', 'Fscore', 'Precision', \
+                  'Recall':
+        assert (eval_results[metric] == 1.0).all()
+
+    tmp_dir.cleanup()
 
 
 @pytest.mark.parametrize('separate_eval', [True, False])
@@ -646,6 +773,47 @@ def test_loveda():
         pseudo_results, metric='mIoU', imgfile_prefix='.format_loveda')
 
     shutil.rmtree('.format_loveda')
+
+
+def test_potsdam():
+    test_dataset = PotsdamDataset(
+        pipeline=[],
+        img_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_potsdam_dataset/img_dir'),
+        ann_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_potsdam_dataset/ann_dir'))
+    assert len(test_dataset) == 1
+
+
+def test_vaihingen():
+    test_dataset = ISPRSDataset(
+        pipeline=[],
+        img_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_vaihingen_dataset/img_dir'),
+        ann_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_vaihingen_dataset/ann_dir'))
+    assert len(test_dataset) == 1
+
+
+def test_isaid():
+    test_dataset = iSAIDDataset(
+        pipeline=[],
+        img_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/img_dir'),
+        ann_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/ann_dir'))
+    assert len(test_dataset) == 2
+    isaid_info = test_dataset.load_annotations(
+        img_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/img_dir'),
+        img_suffix='.png',
+        ann_dir=osp.join(
+            osp.dirname(__file__), '../data/pseudo_isaid_dataset/ann_dir'),
+        seg_map_suffix='.png',
+        split=osp.join(
+            osp.dirname(__file__),
+            '../data/pseudo_isaid_dataset/splits/train.txt'))
+    assert len(isaid_info) == 1
 
 
 @patch('mmseg.datasets.CustomDataset.load_annotations', MagicMock)
